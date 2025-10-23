@@ -3,6 +3,7 @@ from ultralytics import YOLO
 import PIL
 import helper
 import setting
+import torch
 
 def main():
     """
@@ -40,7 +41,17 @@ def main():
         else:
             st.warning("Please upload an image.")
 
-    model = YOLO('best.pt')
+    # Temporarily patch torch.load to use weights_only=False
+    original_torch_load = torch.load
+    def patched_torch_load(*args, **kwargs):
+        kwargs['weights_only'] = False
+        return original_torch_load(*args, **kwargs)
+    
+    torch.load = patched_torch_load
+    try:
+        model = YOLO('best.pt')
+    finally:
+        torch.load = original_torch_load
 
     if st.sidebar.button('Detect Objects'):
         if not source_img:
