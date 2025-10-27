@@ -50,14 +50,14 @@ def load_model():
             torch.load = original_torch_load
     return model
 
-def create_tiles(image: PIL.Image.Image, tile_size: int = 1280, overlap: int = 200) -> List[Tuple[PIL.Image.Image, Tuple[int, int]]]:
+def create_tiles(image: PIL.Image.Image, tile_size: int = 1920, overlap: int = 320) -> List[Tuple[PIL.Image.Image, Tuple[int, int]]]:
     """
     Split large image into overlapping tiles for better detection
     
     Args:
         image: Input PIL Image
-        tile_size: Size of each tile (default 1280x1280)
-        overlap: Overlap between tiles in pixels (default 200)
+        tile_size: Size of each tile (default 1920x1920)
+        overlap: Overlap between tiles in pixels (default 320)
     
     Returns:
         List of tuples (tile_image, (x_offset, y_offset))
@@ -279,11 +279,11 @@ async def detect_objects(
         
         if use_tiling:
             # Process image with tiling for better detection on large images
-            tiles = create_tiles(image, tile_size=1280, overlap=200)
+            tiles = create_tiles(image, tile_size=1920, overlap=320)
             
             for tile_img, (x_offset, y_offset) in tiles:
-                # Run prediction on tile
-                results = model.predict(tile_img, conf=confidence, verbose=False)
+                # Run prediction on tile with proper image size
+                results = model.predict(tile_img, conf=confidence, imgsz=1280, verbose=False)
                 
                 # Process detections from this tile
                 for box in results[0].boxes:
