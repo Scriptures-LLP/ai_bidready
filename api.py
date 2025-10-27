@@ -4,14 +4,16 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 import PIL.Image
+from PIL import ImageDraw
 import torch
 import io
 import base64
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import helper
 import json
 import os
+import cv2
 
 app = FastAPI(
     title="BidReady AI Model API",
@@ -47,6 +49,108 @@ def load_model():
         finally:
             torch.load = original_torch_load
     return model
+
+def create_tiles(image: PIL.Image.Image, tile_size: int = 1280, overlap: int = 200) -> List[Tuple[PIL.Image.Image, Tuple[int, int]]]:
+    """
+    Split large image into overlapping tiles for better detection
+    
+    Args:
+        image: Input PIL Image
+        tile_size: Size of each tile (default 1280x1280)
+        overlap: Overlap between tiles in pixels (default 200)
+    
+    Returns:
+        List of tuples (tile_image, (x_offset, y_offset))
+    """
+    width, height = image.size
+    tiles = []
+    
+    # Calculate step size (tile_size - overlap)
+    step = tile_size - overlap
+    
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            # Calculate tile boundaries
+            x_end = min(x + tile_size, width)
+            y_end = min(y + tile_size, height)
+            
+            # Adjust start position if we're at the edge
+            x_start = max(0, x_end - tile_size)
+            y_start = max(0, y_end - tile_size)
+            
+            # Crop tile
+            tile = image.crop((x_start, y_start, x_end, y_end))
+            tiles.append((tile, (x_start, y_start)))
+    
+    return tiles
+
+def merge_detections(all_detections: List, image_size: Tuple[int, int], iou_threshold: float = 0.5):
+    """
+    Merge detections from multiple tiles, removing duplicates using NMS
+    
+    Args:
+        all_detections: List of detection dictionaries
+        image_size: Original image size (width, height)
+        iou_threshold: IoU threshold for NMS
+    
+    Returns:
+        Filtered list of detections
+    """
+    if not all_detections:
+        return []
+    
+    # Convert to numpy arrays for NMS
+    boxes = []
+    scores = []
+    labels = []
+    
+    for det in all_detections:
+        bbox = det['bbox']
+        boxes.append([bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']])
+        scores.append(det['confidence'])
+        labels.append(det['label'])
+    
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    
+    # Apply NMS per class
+    keep_indices = []
+    unique_labels = set(labels)
+    
+    for label in unique_labels:
+        label_mask = np.array([l == label for l in labels])
+        label_boxes = boxes[label_mask]
+        label_scores = scores[label_mask]
+        label_indices = np.where(label_mask)[0]
+        
+        if len(label_boxes) > 0:
+            # Apply NMS using cv2
+            indices = cv2.dnn.NMSBoxes(
+                label_boxes.tolist(),
+                label_scores.tolist(),
+                score_threshold=0.0,
+                nms_threshold=iou_threshold
+            )
+            
+            if len(indices) > 0:
+                keep_indices.extend(label_indices[indices.flatten()].tolist())
+    
+    # Return filtered detections
+    return [all_detections[i] for i in keep_indices]
+
+def should_use_tiling(image: PIL.Image.Image, threshold: int = 2000) -> bool:
+    """
+    Determine if image should be processed with tiling
+    
+    Args:
+        image: Input PIL Image
+        threshold: Pixel threshold for largest dimension
+    
+    Returns:
+        True if tiling should be used
+    """
+    width, height = image.size
+    return max(width, height) > threshold
 
 @app.on_event("startup")
 async def startup_event():
@@ -115,7 +219,8 @@ async def get_available_labels():
 async def detect_objects(
     file: UploadFile = File(...),
     confidence: Optional[float] = 0.25,
-    selected_labels: Optional[str] = None
+    selected_labels: Optional[str] = None,
+    use_tiling: Optional[bool] = None
 ):
     """
     Detect objects in uploaded image
@@ -124,6 +229,7 @@ async def detect_objects(
         file: Image file (jpg, jpeg, png)
         confidence: Detection confidence threshold (0.0 to 1.0)
         selected_labels: Comma-separated list of labels to detect (optional)
+        use_tiling: Force tiling on/off (auto-detect if None)
     
     Returns:
         JSON with detection results, counts, and annotated image
@@ -139,6 +245,7 @@ async def detect_objects(
         # Read and process image
         contents = await file.read()
         image = PIL.Image.open(io.BytesIO(contents))
+        original_size = image.size
         
         # Load model
         model = load_model()
@@ -164,21 +271,104 @@ async def detect_objects(
                 detail="Confidence must be between 0.0 and 1.0"
             )
         
-        # Run prediction
-        results = model.predict(image, conf=confidence)
+        # Determine if we should use tiling
+        if use_tiling is None:
+            use_tiling = should_use_tiling(image)
         
-        # Filter results by selected labels
-        filtered_boxes = [
-            box for box in results[0].boxes 
-            if model.names[int(box.cls)] in selected_labels_list
-        ]
+        all_detections = []
+        
+        if use_tiling:
+            # Process image with tiling for better detection on large images
+            tiles = create_tiles(image, tile_size=1280, overlap=200)
+            
+            for tile_img, (x_offset, y_offset) in tiles:
+                # Run prediction on tile
+                results = model.predict(tile_img, conf=confidence, verbose=False)
+                
+                # Process detections from this tile
+                for box in results[0].boxes:
+                    label = model.names[int(box.cls)]
+                    if label in selected_labels_list:
+                        # Adjust coordinates to original image space
+                        detection = {
+                            "label": label,
+                            "confidence": float(box.conf),
+                            "bbox": {
+                                "x1": float(box.xyxy[0][0]) + x_offset,
+                                "y1": float(box.xyxy[0][1]) + y_offset,
+                                "x2": float(box.xyxy[0][2]) + x_offset,
+                                "y2": float(box.xyxy[0][3]) + y_offset
+                            }
+                        }
+                        all_detections.append(detection)
+            
+            # Merge overlapping detections
+            detections = merge_detections(all_detections, original_size, iou_threshold=0.5)
+            
+            # Create annotated image manually
+            annotated_image = np.array(image)
+            annotated_pil = PIL.Image.fromarray(annotated_image)
+            draw = ImageDraw.Draw(annotated_pil)
+            
+            # Define colors for different labels
+            colors = {
+                'Column': '#FF0000', 'Curtain Wall': '#00FF00', 'Dimension': '#0000FF',
+                'Door': '#FFFF00', 'Railing': '#FF00FF', 'Sliding Door': '#00FFFF',
+                'Stair Case': '#FFA500', 'Wall': '#800080', 'Window': '#FFC0CB'
+            }
+            
+            for det in detections:
+                bbox = det['bbox']
+                label = det['label']
+                color = colors.get(label, '#FFFFFF')
+                
+                # Draw bounding box
+                draw.rectangle(
+                    [(bbox['x1'], bbox['y1']), (bbox['x2'], bbox['y2'])],
+                    outline=color,
+                    width=3
+                )
+                
+                # Draw label
+                text = f"{label} {det['confidence']:.2f}"
+                draw.text((bbox['x1'], bbox['y1'] - 10), text, fill=color)
+            
+            annotated_image = np.array(annotated_pil)
+            
+        else:
+            # Process normally for smaller images
+            results = model.predict(image, conf=confidence, imgsz=1280)
+            
+            # Filter results by selected labels
+            filtered_boxes = [
+                box for box in results[0].boxes 
+                if model.names[int(box.cls)] in selected_labels_list
+            ]
+            
+            # Prepare detection details
+            detections = []
+            for box in filtered_boxes:
+                detection = {
+                    "label": model.names[int(box.cls)],
+                    "confidence": float(box.conf),
+                    "bbox": {
+                        "x1": float(box.xyxy[0][0]),
+                        "y1": float(box.xyxy[0][1]),
+                        "x2": float(box.xyxy[0][2]),
+                        "y2": float(box.xyxy[0][3])
+                    }
+                }
+                detections.append(detection)
+            
+            # Generate annotated image
+            results[0].boxes = filtered_boxes
+            annotated_image = results[0].plot()[:, :, ::-1]  # Convert BGR to RGB
         
         # Count detected objects
-        object_counts = helper.count_detected_objects(model, filtered_boxes)
-        
-        # Generate annotated image
-        results[0].boxes = filtered_boxes
-        annotated_image = results[0].plot()[:, :, ::-1]  # Convert BGR to RGB
+        object_counts = {}
+        for det in detections:
+            label = det['label']
+            object_counts[label] = object_counts.get(label, 0) + 1
         
         # Convert annotated image to base64
         pil_image = PIL.Image.fromarray(annotated_image)
@@ -186,30 +376,17 @@ async def detect_objects(
         pil_image.save(buffer, format='PNG')
         annotated_image_b64 = base64.b64encode(buffer.getvalue()).decode()
         
-        # Prepare detection details
-        detections = []
-        for box in filtered_boxes:
-            detection = {
-                "label": model.names[int(box.cls)],
-                "confidence": float(box.conf),
-                "bbox": {
-                    "x1": float(box.xyxy[0][0]),
-                    "y1": float(box.xyxy[0][1]),
-                    "x2": float(box.xyxy[0][2]),
-                    "y2": float(box.xyxy[0][3])
-                }
-            }
-            detections.append(detection)
-        
         return {
             "success": True,
-            "total_detections": len(filtered_boxes),
+            "total_detections": len(detections),
             "object_counts": object_counts,
             "detections": detections,
             "annotated_image": f"data:image/png;base64,{annotated_image_b64}",
             "parameters": {
                 "confidence": confidence,
-                "selected_labels": selected_labels_list
+                "selected_labels": selected_labels_list,
+                "tiling_used": use_tiling,
+                "original_image_size": {"width": original_size[0], "height": original_size[1]}
             }
         }
         
