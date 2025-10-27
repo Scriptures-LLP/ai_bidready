@@ -50,14 +50,14 @@ def load_model():
             torch.load = original_torch_load
     return model
 
-def create_tiles(image: PIL.Image.Image, tile_size: int = 1920, overlap: int = 320) -> List[Tuple[PIL.Image.Image, Tuple[int, int]]]:
+def create_tiles(image: PIL.Image.Image, tile_size: int = 1280, overlap: int = 200) -> List[Tuple[PIL.Image.Image, Tuple[int, int]]]:
     """
     Split large image into overlapping tiles for better detection
     
     Args:
         image: Input PIL Image
-        tile_size: Size of each tile (default 1920x1920)
-        overlap: Overlap between tiles in pixels (default 320)
+        tile_size: Size of each tile (default 1280x1280)
+        overlap: Overlap between tiles in pixels (default 200)
     
     Returns:
         List of tuples (tile_image, (x_offset, y_offset))
@@ -138,18 +138,19 @@ def merge_detections(all_detections: List, image_size: Tuple[int, int], iou_thre
     # Return filtered detections
     return [all_detections[i] for i in keep_indices]
 
-def should_use_tiling(image: PIL.Image.Image, threshold: int = 2000) -> bool:
+def should_use_tiling(image: PIL.Image.Image, threshold: int = 5000) -> bool:
     """
     Determine if image should be processed with tiling
     
     Args:
         image: Input PIL Image
-        threshold: Pixel threshold for largest dimension
+        threshold: Pixel threshold for largest dimension (default 5000)
     
     Returns:
         True if tiling should be used
     """
     width, height = image.size
+    # Only use tiling for VERY large images
     return max(width, height) > threshold
 
 @app.on_event("startup")
@@ -279,7 +280,7 @@ async def detect_objects(
         
         if use_tiling:
             # Process image with tiling for better detection on large images
-            tiles = create_tiles(image, tile_size=1920, overlap=320)
+            tiles = create_tiles(image, tile_size=1280, overlap=200)
             
             for tile_img, (x_offset, y_offset) in tiles:
                 # Run prediction on tile with proper image size
@@ -302,8 +303,8 @@ async def detect_objects(
                         }
                         all_detections.append(detection)
             
-            # Merge overlapping detections
-            detections = merge_detections(all_detections, original_size, iou_threshold=0.5)
+            # Merge overlapping detections with lower IOU threshold to keep more detections
+            detections = merge_detections(all_detections, original_size, iou_threshold=0.3)
             
             # Create annotated image manually
             annotated_image = np.array(image)
