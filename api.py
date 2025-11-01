@@ -222,13 +222,159 @@ async def get_available_labels():
         ]
     }
 
-@app.post("/detect")
-async def detect_objects(
-    file: UploadFile = File(...),
-    confidence: Optional[float] = 0.25,
-    selected_labels: Optional[str] = None,
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+import httpx
+import io
+import PIL.Image
+import base64
+import numpy as np
+from typing import Optional
+
+router = APIRouter()
+
+class DetectRequest(BaseModel):
+    image_url: str
+    confidence: Optional[float] = 0.25
+    selected_labels: Optional[str] = None
     use_tiling: Optional[bool] = None
-):
+
+@app.post("/detect")
+async def detect_objects(req: DetectRequest):
+    try:
+        # 1️⃣ Download Image
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(req.image_url)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail="Unable to download image.")
+            image_bytes = resp.content
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error fetching image: {str(e)}")
+
+        # 2️⃣ Read Image
+        try:
+            image = PIL.Image.open(io.BytesIO(image_bytes))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Provided URL is not a valid image")
+
+        original_size = image.size
+        
+        # 3️⃣ Load model
+        model = load_model()
+
+        # 4️⃣ Parse labels
+        available_labels = [
+            'Column', 'Curtain Wall', 'Dimension', 'Door', 'Railing', 
+            'Sliding Door', 'Stair Case', 'Wall', 'Window'
+        ]
+
+        if req.selected_labels:
+            selected_labels_list = [label.strip() for label in req.selected_labels.split(',')]
+            invalid = [x for x in selected_labels_list if x not in available_labels]
+            if invalid:
+                raise HTTPException(
+                    400, f"Invalid labels: {invalid}. Available: {available_labels}"
+                )
+        else:
+            selected_labels_list = available_labels
+
+        # 5️⃣ Validate confidence
+        if not 0.0 <= req.confidence <= 1.0:
+            raise HTTPException(400, "Confidence must be between 0.0 and 1.0")
+
+        # 6️⃣ Decide tiling
+        use_tiling = should_use_tiling(image) if req.use_tiling is None else req.use_tiling
+
+        detections = []
+        all_detections = []
+
+        if use_tiling:
+            tiles = create_tiles(image, 1920, 920)
+            
+            for tile_img, (x_off, y_off) in tiles:
+                results = model.predict(tile_img, conf=req.confidence, imgsz=1280, verbose=False)
+                
+                for box in results[0].boxes:
+                    label = model.names[int(box.cls)]
+                    if label in selected_labels_list:
+                        all_detections.append({
+                            "label": label,
+                            "confidence": float(box.conf),
+                            "bbox": {
+                                "x1": float(box.xyxy[0][0]) + x_off,
+                                "y1": float(box.xyxy[0][1]) + y_off,
+                                "x2": float(box.xyxy[0][2]) + x_off,
+                                "y2": float(box.xyxy[0][3]) + y_off
+                            }
+                        })
+
+            detections = merge_detections(all_detections, original_size, 0.3)
+
+            annotated = np.array(image)
+            draw_img = PIL.Image.fromarray(annotated)
+            draw = ImageDraw.Draw(draw_img)
+
+            colors = {
+                'Column': '#FF0000', 'Curtain Wall': '#00FF00', 'Dimension': '#0000FF',
+                'Door': '#FFFF00', 'Railing': '#FF00FF', 'Sliding Door': '#00FFFF',
+                'Stair Case': '#FFA500', 'Wall': '#800080', 'Window': '#FFC0CB'
+            }
+
+            for det in detections:
+                b, label = det['bbox'], det['label']
+                color = colors.get(label, '#FFFFFF')
+                draw.rectangle([(b['x1'], b['y1']), (b['x2'], b['y2'])], outline=color, width=3)
+                draw.text((b['x1'], b['y1'] - 10), f"{label} {det['confidence']:.2f}", fill=color)
+
+            annotated = np.array(draw_img)
+
+        else:
+            results = model.predict(image, conf=req.confidence, imgsz=1280)
+            filtered = [box for box in results[0].boxes if model.names[int(box.cls)] in selected_labels_list]
+
+            for box in filtered:
+                detections.append({
+                    "label": model.names[int(box.cls)],
+                    "confidence": float(box.conf),
+                    "bbox": {
+                        "x1": float(box.xyxy[0][0]),
+                        "y1": float(box.xyxy[0][1]),
+                        "x2": float(box.xyxy[0][2]),
+                        "y2": float(box.xyxy[0][3])
+                    }
+                })
+
+            results[0].boxes = filtered
+            annotated = results[0].plot()[:, :, ::-1]
+
+        # Count objects
+        counts = {}
+        for d in detections:
+            counts[d['label']] = counts.get(d['label'], 0) + 1
+
+        # Base64 encode image
+        buf = io.BytesIO()
+        PIL.Image.fromarray(annotated).save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        return {
+            "success": True,
+            "total_detections": len(detections),
+            "object_counts": counts,
+            "detections": detections,
+            "annotated_image": f"data:image/png;base64,{b64}",
+            "parameters": {
+                "confidence": req.confidence,
+                "selected_labels": selected_labels_list,
+                "tiling_used": use_tiling,
+                "original_image_size": {"width": original_size[0], "height": original_size[1]}
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Detection failed: {str(e)}")
+
     """
     Detect objects in uploaded image
     
@@ -285,8 +431,9 @@ async def detect_objects(
         all_detections = []
         
         if use_tiling:
+            print("Using tiling for detection")
             # Process image with tiling for better detection on large images
-            tiles = create_tiles(image, tile_size=1920, overlap=320)
+            tiles = create_tiles(image, tile_size=1920, overlap=920)
             
             for tile_img, (x_offset, y_offset) in tiles:
                 # Run prediction on tile with proper image size
