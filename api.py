@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple
 import os
 import tempfile
 import cv2
-from service.detect import detect_shapes, build_svg_from_paths
+from service.detect import detect_shapes, build_svg_from_paths, extract_text_from_bbox_ocr, compute_px_per_inch_from_dimension, convert_area_px_to_sqin
 
 app = FastAPI(
     title="BidReady AI Model API",
@@ -398,9 +398,42 @@ async def detect_objects(
         buf = io.BytesIO()
         PIL.Image.fromarray(annotated).save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
-        # Get shapes and colors (if any) from detect_shapes
+        
+        # 7️⃣ Attempt to compute px_per_inch from first Dimension detection
+        px_per_inch = None
+        dimension_info = None
+        
+        # Find first Dimension detection
+        dimension_detections = [d for d in detections if d['label'] == 'Dimension']
+        if dimension_detections:
+            first_dim = dimension_detections[0]
+            try:
+                # Extract text from dimension bbox using OCR
+                dim_text = extract_text_from_bbox_ocr(req.image_url, first_dim['bbox'])
+                if dim_text:
+                    # Compute px_per_inch
+                    px_per_inch, px_length, real_inches = compute_px_per_inch_from_dimension(
+                        req.image_url, first_dim['bbox'], dim_text
+                    )
+                    dimension_info = {
+                        "text": dim_text,
+                        "px_length": px_length,
+                        "real_inches": real_inches,
+                        "px_per_inch": px_per_inch
+                    }
+            except Exception as e:
+                # If dimension parsing fails, continue without conversion
+                dimension_info = {"error": str(e)}
+        
+        # 8️⃣ Get shapes and convert areas to square inches if px_per_inch available
         shapes_with_colors = detect_shapes(req.image_url, colorize=True)
-        # Provide list of objects as 'shapes' and keep a list of path strings for compatibility
+        
+        # Add area_sq_in to each shape if px_per_inch computed
+        if px_per_inch:
+            for shape in shapes_with_colors:
+                area_px = shape.get('area', 0)
+                shape['area_sq_in'] = convert_area_px_to_sqin(area_px, px_per_inch)
+        
         shapes = shapes_with_colors
 
         # Build an SVG overlay using the colors from detect_shapes (if present)
@@ -409,7 +442,7 @@ async def detect_objects(
         except Exception:
             svg_overlay = None
 
-        return {
+        response_data = {
             "success": True,
             "total_detections": len(detections),
             "object_counts": counts,
@@ -423,6 +456,12 @@ async def detect_objects(
             "shapes": shapes,
             "shapes_svg": svg_overlay,
         }
+        
+        # Add dimension info if available
+        if dimension_info:
+            response_data["dimension_calibration"] = dimension_info
+        
+        return response_data
 
     except Exception as e:
         raise HTTPException(500, f"Detection failed: {str(e)}")
