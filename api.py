@@ -222,7 +222,7 @@ async def get_available_labels():
         ]
     }
 
-from fastapi import APIRouter, HTTPException, Form, File, UploadFile
+from fastapi import APIRouter, HTTPException, File, UploadFile
 from pydantic import BaseModel
 import httpx
 import io
@@ -240,39 +240,11 @@ class DetectRequest(BaseModel):
     use_tiling: Optional[bool] = None
 
 @app.post("/detect")
-async def detect_objects(
-    req: Optional[DetectRequest] = None,
-    image_url: Optional[str] = Form(None),
-    confidence: Optional[float] = Form(None),
-    selected_labels: Optional[str] = Form(None),
-    use_tiling: Optional[str] = Form(None),
-):
+async def detect_objects(req: DetectRequest):
     try:
-        # If the client posted form-data instead of JSON body, fill `req` from the form fields.
-        if req is None:
-            # require image_url from form
-            if not image_url:
-                raise HTTPException(status_code=400, detail="image_url is required")
-
-            # parse optional values; confidence expects float, use_tiling can be truthy string
-            parsed_confidence = float(confidence) if confidence is not None else 0.25
-            parsed_use_tiling = None
-            if use_tiling is not None:
-                # convert common string forms to bool
-                val = str(use_tiling).strip().lower()
-                if val in ("1", "true", "t", "yes", "y", "on"):
-                    parsed_use_tiling = True
-                elif val in ("0", "false", "f", "no", "n", "off"):
-                    parsed_use_tiling = False
-                else:
-                    parsed_use_tiling = None
-
-            req = DetectRequest(
-                image_url=image_url,
-                confidence=parsed_confidence,
-                selected_labels=selected_labels,
-                use_tiling=parsed_use_tiling,
-            )
+        # Endpoint expects application/json with DetectRequest
+        if not req or not getattr(req, "image_url", None):
+            raise HTTPException(status_code=400, detail="image_url is required in JSON body")
 
         # 1️⃣ Download Image or read local path
         try:
@@ -402,11 +374,28 @@ async def detect_objects(
         # 7️⃣ Attempt to compute px_per_inch from Dimension detections
         px_per_inch = None
         dimension_info = None
+        # Also surface up to 5 smallest Dimension boxes for external OCR use
+        dimension_candidates: list = []
         
         # Find ALL Dimension detections
         dimension_detections = [d for d in detections if d['label'] == 'Dimension']
         
         if dimension_detections:
+            # Compute area for each detection and keep a compact copy for response
+            def _area(det):
+                b = det['bbox']
+                return max(0.0, (b['x2'] - b['x1'])) * max(0.0, (b['y2'] - b['y1']))
+
+            # Top 5 smallest by area for client-side OCR or fallback flows
+            sorted_by_area = sorted(dimension_detections, key=_area)
+            for det in sorted_by_area[:5]:
+                b = det['bbox']
+                dimension_candidates.append({
+                    "bbox": {"x1": float(b['x1']), "y1": float(b['y1']), "x2": float(b['x2']), "y2": float(b['y2'])},
+                    "confidence": float(det.get('confidence', 0.0)),
+                    "area_px": float(_area(det))
+                })
+
             # Smart selection: Try top 3 smallest bboxes (likely actual dimension text, not lines)
             def score_dimension(det):
                 bbox = det['bbox']
@@ -552,6 +541,9 @@ async def detect_objects(
             "shapes": shapes,
             "shapes_svg": svg_overlay,
         }
+        # Always include up to 5 smallest Dimension boxes for OCR on client if needed
+        if dimension_candidates:
+            response_data["dimension_candidates"] = dimension_candidates
         
         # Add dimension info if available
         if dimension_info:
