@@ -37,7 +37,11 @@ def detect_shapes(image_link, min_area=800, max_area=100000, colorize: bool = Fa
     URL the image is downloaded to a temporary file, processed, and then the
     temporary file is removed.
 
-    Returns a list of path strings (e.g. 'M10,10L20,10L20,20Z').
+    Returns a list of objects for each path in the form:
+        {'path': 'M10,10L20,10L20,20Z', 'area': 1234.5}
+
+    If `colorize=True`, a 'color' key will also be added:
+        {'path': '...', 'area': 1234.5, 'color': '#aabbcc'}
     """
     downloaded_temp = None
     # Determine whether image_link is a URL
@@ -77,15 +81,21 @@ def detect_shapes(image_link, min_area=800, max_area=100000, colorize: bool = Fa
             # Check if the contour area is within the specified range
             if min_area <= contour_area <= max_area:
                 path_data = "M" + "L".join([f"{point[0][0]},{point[0][1]}" for point in contour]) + "Z"
+                # compute contour area
+                contour_area = float(contour_area)
                 if colorize:
                     # Assign a random color per path (hex)
                     col = '#' + ''.join(random.choice('0123456789ABCDEF') for _ in range(6))
                     detected_plots_position.append({
                         'path': path_data,
+                        'area': contour_area,
                         'color': col,
                     })
                 else:
-                    detected_plots_position.append(path_data)
+                    detected_plots_position.append({
+                        'path': path_data,
+                        'area': contour_area,
+                    })
 
         return detected_plots_position
 
@@ -158,9 +168,11 @@ def build_svg_from_paths(
             if isinstance(p, dict):
                 path_str = p.get('path')
                 col = p.get('color', stroke_color)
+                area_val = p.get('area')
             else:
                 path_str = p
                 col = stroke_color
+                area_val = None
 
             if svg_fill and svg_fill.strip().lower() != "none":
                 fill_value = svg_fill
@@ -177,11 +189,16 @@ def build_svg_from_paths(
                         fill_value = svg_fill
                         fill_op = fill_opacity
 
+            # Add a data-area attribute for the path (if area known) and a title for hover
+            area_attr = f' data-area="{area_val}"' if area_val is not None else ''
             attrs = (
                 f'stroke="{col}" stroke-width="{stroke_width}" '
-                f'fill="{fill_value}" fill-opacity="{fill_op}" stroke-linejoin="round" stroke-linecap="round"'
+                f'fill="{fill_value}" fill-opacity="{fill_op}" stroke-linejoin="round" stroke-linecap="round"{area_attr}'
             )
-            svg_paths.append(f'<path d="{path_str}" {attrs} />')
+            if area_val is not None:
+                svg_paths.append(f'<path d="{path_str}" {attrs}><title>{area_val}</title></path>')
+            else:
+                svg_paths.append(f'<path d="{path_str}" {attrs} />')
 
         svg_inner = "\n".join(svg_paths)
         svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}">\n{svg_inner}\n</svg>'

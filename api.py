@@ -400,8 +400,8 @@ async def detect_objects(
         b64 = base64.b64encode(buf.getvalue()).decode()
         # Get shapes and colors (if any) from detect_shapes
         shapes_with_colors = detect_shapes(req.image_url, colorize=True)
-        # Ensure legacy 'shapes' output is a list of path strings
-        shapes = [s['path'] if isinstance(s, dict) else s for s in shapes_with_colors]
+        # Provide list of objects as 'shapes' and keep a list of path strings for compatibility
+        shapes = shapes_with_colors
 
         # Build an SVG overlay using the colors from detect_shapes (if present)
         try:
@@ -414,7 +414,6 @@ async def detect_objects(
             "total_detections": len(detections),
             "object_counts": counts,
             "detections": detections,
-            "annotated_image": f"data:image/png;base64,{b64}",
             "parameters": {
                 "confidence": req.confidence,
                 "selected_labels": selected_labels_list,
