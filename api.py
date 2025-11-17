@@ -10,8 +10,10 @@ import io
 import base64
 import numpy as np
 from typing import List, Optional, Tuple
+import os
+import tempfile
 import cv2
-from service.detect import detect_shapes
+from service.detect import detect_shapes, build_svg_from_paths
 
 app = FastAPI(
     title="BidReady AI Model API",
@@ -220,7 +222,7 @@ async def get_available_labels():
         ]
     }
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Form, File, UploadFile
 from pydantic import BaseModel
 import httpx
 import io
@@ -238,15 +240,56 @@ class DetectRequest(BaseModel):
     use_tiling: Optional[bool] = None
 
 @app.post("/detect")
-async def detect_objects(req: DetectRequest):
+async def detect_objects(
+    req: Optional[DetectRequest] = None,
+    image_url: Optional[str] = Form(None),
+    confidence: Optional[float] = Form(None),
+    selected_labels: Optional[str] = Form(None),
+    use_tiling: Optional[str] = Form(None),
+):
     try:
-        # 1️⃣ Download Image
+        # If the client posted form-data instead of JSON body, fill `req` from the form fields.
+        if req is None:
+            # require image_url from form
+            if not image_url:
+                raise HTTPException(status_code=400, detail="image_url is required")
+
+            # parse optional values; confidence expects float, use_tiling can be truthy string
+            parsed_confidence = float(confidence) if confidence is not None else 0.25
+            parsed_use_tiling = None
+            if use_tiling is not None:
+                # convert common string forms to bool
+                val = str(use_tiling).strip().lower()
+                if val in ("1", "true", "t", "yes", "y", "on"):
+                    parsed_use_tiling = True
+                elif val in ("0", "false", "f", "no", "n", "off"):
+                    parsed_use_tiling = False
+                else:
+                    parsed_use_tiling = None
+
+            req = DetectRequest(
+                image_url=image_url,
+                confidence=parsed_confidence,
+                selected_labels=selected_labels,
+                use_tiling=parsed_use_tiling,
+            )
+
+        # 1️⃣ Download Image or read local path
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.get(req.image_url)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=400, detail="Unable to download image.")
-            image_bytes = resp.content
+            if isinstance(req.image_url, str) and req.image_url.lower().startswith(("http://", "https://")):
+                async with httpx.AsyncClient(timeout=20) as client:
+                    resp = await client.get(req.image_url)
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=400, detail="Unable to download image.")
+                image_bytes = resp.content
+            else:
+                # assume it's a local filesystem path
+                if not os.path.exists(req.image_url):
+                    raise HTTPException(status_code=400, detail="Provided local image path does not exist")
+                with open(req.image_url, 'rb') as f:
+                    image_bytes = f.read()
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error fetching image: {str(e)}")
 
@@ -355,7 +398,16 @@ async def detect_objects(req: DetectRequest):
         buf = io.BytesIO()
         PIL.Image.fromarray(annotated).save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
-        shapes = detect_shapes(req.image_url)
+        # Get shapes and colors (if any) from detect_shapes
+        shapes_with_colors = detect_shapes(req.image_url, colorize=True)
+        # Ensure legacy 'shapes' output is a list of path strings
+        shapes = [s['path'] if isinstance(s, dict) else s for s in shapes_with_colors]
+
+        # Build an SVG overlay using the colors from detect_shapes (if present)
+        try:
+            svg_overlay = build_svg_from_paths(shapes_with_colors, original_size[0], original_size[1], stroke_color='#0b61e9', stroke_width=2, svg_fill='none', fill_opacity=0.12)
+        except Exception:
+            svg_overlay = None
 
         return {
             "success": True,
@@ -369,7 +421,8 @@ async def detect_objects(req: DetectRequest):
                 "tiling_used": use_tiling,
                 "original_image_size": {"width": original_size[0], "height": original_size[1]}
             },
-            "shapes": shapes
+            "shapes": shapes,
+            "shapes_svg": svg_overlay,
         }
 
     except Exception as e:
@@ -380,7 +433,24 @@ async def detect_objects_simple(file: UploadFile = File(...)):
     """
     Simplified detection endpoint with default parameters
     """
-    return await detect_objects(file=file)
+    # Save upload to temporary file and call the main detect endpoint logic via DetectRequest
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1] if file.filename else '.png')
+        contents = await file.read()
+        tmp.write(contents)
+        tmp.flush()
+        tmp.close()
+        # Build a DetectRequest targeting the local temp path (detect_objects supports local paths)
+        req = DetectRequest(image_url=tmp.name, confidence=0.25)
+        response = await detect_objects(req)
+        return response
+    finally:
+        if tmp and os.path.exists(tmp.name):
+            try:
+                os.remove(tmp.name)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     import uvicorn
