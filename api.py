@@ -235,7 +235,7 @@ router = APIRouter()
 
 class DetectRequest(BaseModel):
     image_url: str
-    confidence: Optional[float] = 0.25
+    confidence: Optional[float] = 0.4
     selected_labels: Optional[str] = None
     use_tiling: Optional[bool] = None
 
