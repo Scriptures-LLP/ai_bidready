@@ -303,7 +303,7 @@ async def detect_objects(req: DetectRequest):
         all_detections = []
 
         if use_tiling:
-            tiles = create_tiles(image, 1920, 920)
+            tiles = create_tiles(image, 1920, 300)
             
             for tile_img, (x_off, y_off) in tiles:
                 results = model.predict(tile_img, conf=req.confidence, imgsz=1280, verbose=False)
