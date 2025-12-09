@@ -9,7 +9,7 @@ import torch
 import io
 import base64
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import os
 import tempfile
 import cv2
@@ -50,7 +50,7 @@ def load_model():
             torch.load = original_torch_load
     return model
 
-def create_tiles(image: PIL.Image.Image, tile_size: int = 1920, overlap: int = 320) -> List[Tuple[PIL.Image.Image, Tuple[int, int]]]:
+def create_tiles(image: PIL.Image.Image, tile_size: int , overlap: int ) -> List[Tuple[PIL.Image.Image, Tuple[int, int]]]:
     """
     Split large image into overlapping tiles for better detection
     
@@ -235,9 +235,11 @@ router = APIRouter()
 
 class DetectRequest(BaseModel):
     image_url: str
-    confidence: Optional[float] = 0.4
+    confidence: Optional[float] = 0
     selected_labels: Optional[str] = None
     use_tiling: Optional[bool] = None
+    per_class_conf: Optional[Dict[str, float]] = None
+    calibration: Optional[float] = None
 
 @app.post("/detect")
 async def detect_objects(req: DetectRequest):
@@ -302,8 +304,19 @@ async def detect_objects(req: DetectRequest):
         detections = []
         all_detections = []
 
+        # Build per-class confidence mapping (validate values and labels)
+        per_class_conf_map: Dict[str, float] = {}
+        if req.per_class_conf:
+            for k, v in req.per_class_conf.items():
+                try:
+                    f = float(v)
+                except Exception:
+                    continue
+                if 0.0 <= f <= 1.0:
+                    per_class_conf_map[k] = f
+
         if use_tiling:
-            tiles = create_tiles(image, 1920, 300)
+            tiles = create_tiles(image, 1400, 350)
             
             for tile_img, (x_off, y_off) in tiles:
                 results = model.predict(tile_img, conf=req.confidence, imgsz=1280, verbose=False)
@@ -311,6 +324,10 @@ async def detect_objects(req: DetectRequest):
                 for box in results[0].boxes:
                     label = model.names[int(box.cls)]
                     if label in selected_labels_list:
+                        # Use per-class threshold if provided else default to req.confidence
+                        label_min_conf = per_class_conf_map.get(label, req.confidence)
+                        if float(box.conf) < label_min_conf:
+                            continue
                         all_detections.append({
                             "label": label,
                             "confidence": float(box.conf),
@@ -322,7 +339,7 @@ async def detect_objects(req: DetectRequest):
                             }
                         })
 
-            detections = merge_detections(all_detections, original_size, 0.3)
+            detections = merge_detections(all_detections, original_size, iou_threshold=0.3)
 
             annotated = np.array(image)
             draw_img = PIL.Image.fromarray(annotated)
@@ -344,7 +361,15 @@ async def detect_objects(req: DetectRequest):
 
         else:
             results = model.predict(image, conf=req.confidence, imgsz=1280)
-            filtered = [box for box in results[0].boxes if model.names[int(box.cls)] in selected_labels_list]
+            filtered = []
+            for box in results[0].boxes:
+                label = model.names[int(box.cls)]
+                if label not in selected_labels_list:
+                    continue
+                label_min_conf = per_class_conf_map.get(label, req.confidence)
+                if float(box.conf) < label_min_conf:
+                    continue
+                filtered.append(box)
 
             for box in filtered:
                 detections.append({
@@ -371,9 +396,10 @@ async def detect_objects(req: DetectRequest):
         PIL.Image.fromarray(annotated).save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
         
-        # 7️⃣ Attempt to compute px_per_inch from Dimension detections
-        px_per_inch = None
+        # 7️⃣ Attempt to compute px_per_inch from Dimension detections or request
+        px_per_inch = req.calibration if req.calibration and req.calibration > 0 else None
         dimension_info = None
+        
         # Also surface up to 5 smallest Dimension boxes for external OCR use
         dimension_candidates: list = []
         
@@ -407,8 +433,16 @@ async def detect_objects(req: DetectRequest):
             
             # Sort by score and take top 3 smallest candidates
             dimension_detections.sort(key=score_dimension, reverse=True)
-            top_candidates = dimension_detections[:3]
             
+            if px_per_inch:
+                dimension_info = {
+                    "px_per_inch": px_per_inch,
+                    "method": "manual_override"
+                }
+                top_candidates = []
+            else:
+                top_candidates = dimension_detections[:3]
+
             # Create debug directory if it doesn't exist
             debug_dir = "debug_dimension_crops"
             os.makedirs(debug_dir, exist_ok=True)
@@ -461,6 +495,7 @@ async def detect_objects(req: DetectRequest):
                         "error": str(e)
                     })
                     continue
+            
             
             # If we didn't find any valid dimension, report attempts
             if not dimension_info:
@@ -544,6 +579,9 @@ async def detect_objects(req: DetectRequest):
         # Always include up to 5 smallest Dimension boxes for OCR on client if needed
         if dimension_candidates:
             response_data["dimension_candidates"] = dimension_candidates
+        # Echo per-class threshold mapping for debugging/observability
+        if per_class_conf_map:
+            response_data["per_class_conf"] = per_class_conf_map
         
         # Add dimension info if available
         if dimension_info:
