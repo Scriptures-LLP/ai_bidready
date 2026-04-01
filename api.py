@@ -3,6 +3,10 @@ import io
 import os
 import tempfile
 from typing import Dict, List, Optional, Tuple
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 import cv2
 import numpy as np
@@ -244,8 +248,8 @@ async def get_building_mask_from_gemini(image: PIL.Image.Image):
     Sends the blueprint to Gemini 1.5 Flash / 3.0 Preview to dynamically validate
     where the true architectural structure is, skipping outside grid tracking.
     """
-    api_key = "AIzaSyBxWtNN7yGz40aSP0K2OLZyDhqm_z5kJg4"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={api_key}"
+    api_key = os.getenv("GEMINI_API_KEY", "AIzaSyCDQ0PeW3GKx6NK2PiHViRFBnvQJGPU1ck") # Use env or fallback
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={api_key}"
     
     max_size = 1000
     w, h = image.size
@@ -269,20 +273,41 @@ async def get_building_mask_from_gemini(image: PIL.Image.Image):
         "generationConfig": {"responseMimeType": "application/json"}
     }
     
+    print(f"Gemini Request: Sending image ({img_resized.size[0]}x{img_resized.size[1]}) to Gemini...")
+    
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        import asyncio
+        # Use a longer timeout for complex vision tasks
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, json=payload)
             if resp.status_code == 200:
                 data = resp.json()
-                text = data['candidates'][0]['content']['parts'][0]['text']
-                import json
-                parsed = json.loads(text)
-                return parsed.get("building_bbox")
+                try:
+                    text = data['candidates'][0]['content']['parts'][0]['text']
+                    # Handle potential markdown formatting in JSON response
+                    if "```json" in text:
+                        text = text.split("```json")[1].split("```")[0].strip()
+                    elif "```" in text:
+                        text = text.split("```")[1].split("```")[0].strip()
+                    
+                    import json
+                    parsed = json.loads(text)
+                    bbox = parsed.get("building_bbox")
+                    if bbox:
+                        print(f"Gemini Mask Success: {bbox}")
+                    return bbox
+                except (KeyError, IndexError, json.JSONDecodeError) as e:
+                    print(f"Gemini Parse Error: {e}. Raw text: {text if 'text' in locals() else 'N/A'}")
             else:
                 print(f"Gemini API Warn: {resp.status_code} - {resp.text}")
+    except asyncio.CancelledError:
+        print("Gemini Mask Request was cancelled (likely client disconnect).")
+        # Re-raise CancelledError to let FastAPI handle it properly, 
+        # but now we have a log of where it happened.
+        raise
     except Exception as e:
-        print(f"Gemini Mask API Error: {e}")
+        print(f"Gemini Mask API Error: {type(e).__name__}: {e}")
         
     return None
 
@@ -475,16 +500,22 @@ async def detect_objects(req: DetectRequest):
         
         padded_bbox = None
         if gemini_bbox and len(gemini_bbox) == 4:
-            ymin, xmin, ymax, xmax = gemini_bbox
-            # Allow 3% padding so perimeter walls/windows touching the edge don't get clipped
-            pad_y = max(0.02, (ymax - ymin) * 0.03)
-            pad_x = max(0.02, (xmax - xmin) * 0.03)
-            padded_bbox = {
-                "ymin": max(0.0, ymin - pad_y) * img_h,
-                "xmin": max(0.0, xmin - pad_x) * img_w,
-                "ymax": min(1.0, ymax + pad_y) * img_h,
-                "xmax": min(1.0, xmax + pad_x) * img_w
-            }
+            try:
+                # Ensure values are floats, as Gemini sometimes returns strings
+                ymin, xmin, ymax, xmax = map(float, gemini_bbox)
+                
+                # Allow 3% padding so perimeter walls/windows touching the edge don't get clipped
+                pad_y = max(0.02, (ymax - ymin) * 0.03)
+                pad_x = max(0.02, (xmax - xmin) * 0.03)
+                padded_bbox = {
+                    "ymin": max(0.0, ymin - pad_y) * img_h,
+                    "xmin": max(0.0, xmin - pad_x) * img_w,
+                    "ymax": min(1.0, ymax + pad_y) * img_h,
+                    "xmax": min(1.0, xmax + pad_x) * img_w
+                }
+            except (ValueError, TypeError) as e:
+                print(f"Error processing Gemini bbox: {e}")
+                padded_bbox = None
 
         # 3️⃣ Load model
         model = load_model()
