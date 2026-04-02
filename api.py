@@ -86,17 +86,14 @@ def is_false_positive_wall(bbox, img_w, img_h):
         return True
 
     # CASE D: Random Big Boxes and Squares (False Positive Wall clustering)
-    # True walls are almost exclusively long, thin lines. 
-    # If a wall is "square-ish", it can only be a tiny structural pillar.
-    # We aggressively filter out any non-thin boxes that are visibly large.
-    
-    if box_area > (img_area * 0.0003) and aspect < 4:
+    # Relaxed: Real walls can sometimes have lower aspect ratios if they are short segments.
+    if box_area > (img_area * 0.0005) and aspect < 3:
         return True
         
-    if box_area > (img_area * 0.001) and aspect < 6:
+    if box_area > (img_area * 0.002) and aspect < 5:
         return True
         
-    if box_area > (img_area * 0.003) and aspect < 10:
+    if box_area > (img_area * 0.005) and aspect < 8:
         return True
         
     if box_area > (img_area * 0.01) and aspect < 15:
@@ -530,10 +527,9 @@ async def detect_objects(req: DetectRequest):
                     ymax /= 1000.0
                     xmax /= 1000.0
                 
-                # Allow 3% padding so perimeter walls/windows touching the edge don't get clipped
-                # We use a slightly tighter filter now to be more aggressive against dimensions
-                pad_y = (ymax - ymin) * 0.02
-                pad_x = (xmax - xmin) * 0.02
+                # Allow 4% padding (increased from 2%) so perimeter walls/windows touching the edge don't get clipped
+                pad_y = (ymax - ymin) * 0.04
+                pad_x = (xmax - xmin) * 0.04
                 padded_bbox = {
                     "ymin": float(max(0.0, ymin - pad_y) * img_h),
                     "xmin": float(max(0.0, xmin - pad_x) * img_w),
@@ -615,9 +611,9 @@ async def detect_objects(req: DetectRequest):
                         # Use per-class threshold if provided else default to req.confidence
                         label_min_conf = per_class_conf_map.get(label, req.confidence)
                         
-                        # Aggressive Wall Boost: Drop threshold internally to scoop up weak lines (corridors)
+                        # Aggressive Wall Boost: Drop threshold even further (0.05) to catch missing walls
                         if label == "Wall":
-                            label_min_conf = min(0.10, label_min_conf)
+                            label_min_conf = min(0.03, label_min_conf)
                             
                         if float(box.conf) < label_min_conf:
                             continue
@@ -696,7 +692,7 @@ async def detect_objects(req: DetectRequest):
                 
                 label_min_conf = per_class_conf_map.get(label, req.confidence)
                 if label == "Wall":
-                    label_min_conf = min(0.10, label_min_conf)
+                    label_min_conf = min(0.05, label_min_conf)
                     
                 if float(box.conf) < label_min_conf:
                     continue
