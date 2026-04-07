@@ -87,7 +87,12 @@ def is_false_positive_wall(bbox, img_w, img_h):
     if box_area > (img_area * 0.6):
         return True
 
-    # CASE D: Large near-edge boxes (likely title block or grid artifacts)
+    # CASE D: Giant wall blocks (bad full-area boxes)
+    # Remove only if the box is huge AND not a long, thin wall segment.
+    if box_area > (img_area * 0.12) and aspect < 6:
+        return True
+
+    # CASE E: Large near-edge boxes (likely title block or grid artifacts)
     # Only apply aggressive filtering near borders/title block to protect interior walls.
     if edge_or_title:
         if box_area > (img_area * 0.02) and aspect < 4:
@@ -95,7 +100,7 @@ def is_false_positive_wall(bbox, img_w, img_h):
         if box_area > (img_area * 0.05) and aspect < 8:
             return True
 
-    # CASE E: Dimension/grid lines (long thin lines) near edges or title block
+    # CASE F: Dimension/grid lines (long thin lines) near edges or title block
     if edge_or_title and aspect > 60:
         return True
 
