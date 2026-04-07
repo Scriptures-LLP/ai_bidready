@@ -61,6 +61,11 @@ def is_false_positive_wall(bbox, img_w, img_h):
     # 1. Detect border lines (page frames wrapping the drawing)
     # They usually sit extremely close to the edges (within 3%) and span almost the entire page (> 85%)
     aspect = max(w, h) / min(w, h) if min(w, h) > 0 else 9999
+    width_ratio = w / img_w
+    height_ratio = h / img_h
+    thickness_ratio = min(width_ratio, height_ratio)
+    min_dim = max(1, min(img_w, img_h))
+    max_wall_thickness_px = max(10, min_dim * 0.012)
     
     edge_thresh_x = max(20, img_w * 0.03)  
     edge_thresh_y = max(20, img_h * 0.03)  
@@ -78,6 +83,10 @@ def is_false_positive_wall(bbox, img_w, img_h):
 
     # Vertical page borders
     if h > (img_h * 0.85) and (near_left or near_right) and aspect > 10:
+        return True
+
+    # CASE B: Walls should be thin; drop thick blocks before other checks.
+    if min(w, h) > max_wall_thickness_px:
         return True
 
     # CASE C: Large Frame detection
@@ -653,7 +662,7 @@ async def detect_objects(req: DetectRequest):
                 padded_bbox = calculate_core_building_bbox(all_detections, original_size[0], original_size[1])
 
             def is_valid_det(d):
-                if d["label"] == "Wall" and is_false_positive_wall(d["bbox"], original_size[0], original_size[1]):
+                if "wall" in str(d["label"]).lower() and is_false_positive_wall(d["bbox"], original_size[0], original_size[1]):
                     return False
                 if padded_bbox:
                     cx = (d["bbox"]["x1"] + d["bbox"]["x2"]) / 2.0
@@ -727,7 +736,7 @@ async def detect_objects(req: DetectRequest):
                 padded_bbox = calculate_core_building_bbox(all_raw_detections, original_size[0], original_size[1])
 
             def is_valid_det(d):
-                if d["label"] == "Wall" and is_false_positive_wall(d["bbox"], original_size[0], original_size[1]):
+                if "wall" in str(d["label"]).lower() and is_false_positive_wall(d["bbox"], original_size[0], original_size[1]):
                     return False
                 if padded_bbox:
                     cx = (d["bbox"]["x1"] + d["bbox"]["x2"]) / 2.0
