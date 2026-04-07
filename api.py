@@ -69,6 +69,8 @@ def is_false_positive_wall(bbox, img_w, img_h):
     near_bottom = (y2 > img_h - edge_thresh_y)
     near_left = (x1 < edge_thresh_x)
     near_right = (x2 > img_w - edge_thresh_x)
+    in_title_block = (x1 > img_w * 0.85)
+    edge_or_title = near_top or near_bottom or near_left or near_right or in_title_block
 
     # Horizontal page borders
     if w > (img_w * 0.85) and (near_top or near_bottom) and aspect > 10:
@@ -85,27 +87,16 @@ def is_false_positive_wall(bbox, img_w, img_h):
     if box_area > (img_area * 0.6):
         return True
 
-    # CASE D: Random Big Boxes and Squares (False Positive Wall clustering)
-    # Relaxed: Real walls can sometimes have lower aspect ratios if they are short segments.
-    if box_area > (img_area * 0.0005) and aspect < 3:
-        return True
-        
-    if box_area > (img_area * 0.002) and aspect < 5:
-        return True
-        
-    if box_area > (img_area * 0.005) and aspect < 8:
-        return True
-        
-    if box_area > (img_area * 0.01) and aspect < 15:
-        return True
-    
-    if box_area > (img_area * 0.03) and aspect < 30:
-        return True
+    # CASE D: Large near-edge boxes (likely title block or grid artifacts)
+    # Only apply aggressive filtering near borders/title block to protect interior walls.
+    if edge_or_title:
+        if box_area > (img_area * 0.02) and aspect < 4:
+            return True
+        if box_area > (img_area * 0.05) and aspect < 8:
+            return True
 
-    # CASE E: Dimension line detection (long thin lines near edges or with regular spacing)
-    # Most dimension lines are very thin and have a very high aspect ratio but are 
-    # disconnected from the main building core.
-    if aspect > 50:
+    # CASE E: Dimension/grid lines (long thin lines) near edges or title block
+    if edge_or_title and aspect > 60:
         return True
 
     return False
@@ -499,6 +490,17 @@ async def detect_objects(req: DetectRequest):
 
         original_size = image.size
         img_w, img_h = original_size
+        max_dim = max(original_size)
+
+        # Tune tiling and model input size for higher-resolution images.
+        if max_dim >= 2400:
+            tile_size = 1600
+            tile_overlap = tile_size // 2
+            model_imgsz = 1600
+        else:
+            tile_size = 1200
+            tile_overlap = tile_size // 2
+            model_imgsz = 1280
         
         # Gemini Hybrid Validation: Grabs the tightest main architectural bounds to block exterior garbage
         gemini_bbox = await get_building_mask_from_gemini(image)
@@ -527,16 +529,23 @@ async def detect_objects(req: DetectRequest):
                     ymax /= 1000.0
                     xmax /= 1000.0
                 
-                # Allow 4% padding (increased from 2%) so perimeter walls/windows touching the edge don't get clipped
-                pad_y = (ymax - ymin) * 0.04
-                pad_x = (xmax - xmin) * 0.04
+                # Allow more padding so perimeter walls/windows touching the edge don't get clipped
+                pad_y = (ymax - ymin) * 0.08
+                pad_x = (xmax - xmin) * 0.08
                 padded_bbox = {
                     "ymin": float(max(0.0, ymin - pad_y) * img_h),
                     "xmin": float(max(0.0, xmin - pad_x) * img_w),
                     "ymax": float(min(1.0, ymax + pad_y) * img_h),
                     "xmax": float(min(1.0, xmax + pad_x) * img_w)
                 }
-                print(f"Gemini Final Boundary: {padded_bbox}")
+                bbox_area = max(0.0, padded_bbox["xmax"] - padded_bbox["xmin"]) * max(
+                    0.0, padded_bbox["ymax"] - padded_bbox["ymin"]
+                )
+                if bbox_area < (img_w * img_h * 0.35):
+                    print("Gemini bbox too small, ignoring.")
+                    padded_bbox = None
+                else:
+                    print(f"Gemini Final Boundary: {padded_bbox}")
             except (ValueError, TypeError) as e:
                 print(f"Error processing Gemini bbox: {e}")
                 padded_bbox = None
@@ -598,11 +607,11 @@ async def detect_objects(req: DetectRequest):
                     per_class_conf_map[k] = f
 
         if use_tiling:
-            tiles = create_tiles(image, 1200, 600)
+            tiles = create_tiles(image, tile_size, tile_overlap)
 
             for tile_img, (x_off, y_off) in tiles:
                 results = model.predict(
-                    tile_img, conf=req.confidence, imgsz=1280, verbose=False
+                    tile_img, conf=req.confidence, imgsz=model_imgsz, verbose=False
                 )
 
                 for box in results[0].boxes:
@@ -683,7 +692,7 @@ async def detect_objects(req: DetectRequest):
             annotated = np.array(draw_img)
 
         else:
-            results = model.predict(image, conf=req.confidence, imgsz=1280, verbose=False)
+            results = model.predict(image, conf=req.confidence, imgsz=model_imgsz, verbose=False)
             all_raw_detections = []
             for box in results[0].boxes:
                 label = model.names[int(box.cls)]
